@@ -44,32 +44,50 @@ log = get_logger(__name__)
 
 # Dataset to precompute all tensors during initialization
 class ClimateDataset(Dataset):
-    def __init__(self, inputs_norm_dask, outputs_dask, output_is_normalized=True):
+    def __init__(self, inputs_norm_dask, outputs_dask, T=3, output_is_normalized=True):
         # Store dataset size
-        self.size = inputs_norm_dask.shape[0]
+        # self.size = inputs_norm_dask.shape[0]
 
-        # Log once with basic information
-        log.info(
-            f"Creating dataset: {self.size} samples, input shape: {inputs_norm_dask.shape}, normalized output: {output_is_normalized}"
-        )
+        # # Log once with basic information
+        # log.info(
+        #     f"Creating dataset: {self.size} samples, input shape: {inputs_norm_dask.shape}, normalized output: {output_is_normalized}"
+        # )
 
-        # Precompute all tensors in one go
+        # # Precompute all tensors in one go
+        # inputs_np = inputs_norm_dask.compute()
+        # outputs_np = outputs_dask.compute()
+
+        # # Convert to PyTorch tensors
+        # self.input_tensors = torch.from_numpy(inputs_np).float()
+        # self.output_tensors = torch.from_numpy(outputs_np).float()
+
+        # # Handle NaN values (should not occur)
+        # if torch.isnan(self.input_tensors).any() or torch.isnan(self.output_tensors).any():
+        #     raise ValueError("NaN values detected in dataset tensors")
+
+        self.T = T
+        self.output_is_normalized = output_is_normalized
+
         inputs_np = inputs_norm_dask.compute()
         outputs_np = outputs_dask.compute()
 
-        # Convert to PyTorch tensors
-        self.input_tensors = torch.from_numpy(inputs_np).float()
+        self.input_tensors = torch.from_numpy(inputs_np).float()  # shape: (time, C, H, W)
         self.output_tensors = torch.from_numpy(outputs_np).float()
 
-        # Handle NaN values (should not occur)
-        if torch.isnan(self.input_tensors).any() or torch.isnan(self.output_tensors).any():
-            raise ValueError("NaN values detected in dataset tensors")
+        self.size = inputs_np.shape[0] - T + 1
 
     def __len__(self):
         return self.size
 
     def __getitem__(self, idx):
-        return self.input_tensors[idx], self.output_tensors[idx]
+        # return self.input_tensors[idx], self.output_tensors[idx]
+        x_seq = self.input_tensors[idx : idx + self.T]  # shape: (T, C, H, W)
+        # x_seq = x_seq.permute(1, 0, 2, 3).reshape(-1, 48, 72)  # (C×T, H, W)
+        x_seq = x_seq.permute(1, 0, 2, 3)  # ➜ (C, T, H, W)
+        x_seq = x_seq.permute(1, 0, 2, 3)  # Final shape: (T, C, H, W)
+        y = self.output_tensors[idx + self.T - 1]  # predict only for final month
+
+        return x_seq, y
 
 
 def _load_process_ssp_data(ds, ssp, input_variables, output_variables, member_id, spatial_template):
@@ -143,10 +161,12 @@ class ClimateEmulationDataModule(LightningDataModule):
         eval_batch_size: int = None,
         num_workers: int = 0,
         seed: int = 42,
+        temporal_window: int = 1,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.hparams.path = to_absolute_path(path)
+        self.temporal_window = temporal_window
         self.normalizer = Normalizer()
 
         # Set evaluation batch size to training batch size if not specified
@@ -235,7 +255,8 @@ class ClimateEmulationDataModule(LightningDataModule):
             )
 
             # --- Slice Test Data ---
-            test_slice = slice(-self.hparams.test_months, None)  # Last N months
+            # test_slice = slice(-self.hparams.test_months, None)  # Last N months
+            test_slice = slice(-(self.hparams.test_months + self.temporal_window - 1), None)
 
             sliced_test_input_dask = full_test_input_dask[test_slice]
             sliced_test_output_raw_dask = full_test_output_dask[test_slice]
@@ -245,14 +266,16 @@ class ClimateEmulationDataModule(LightningDataModule):
             test_output_raw_dask = sliced_test_output_raw_dask  # Keep unnormed for evaluation
 
         # Create datasets
-        self.train_dataset = ClimateDataset(train_input_norm_dask, train_output_norm_dask, output_is_normalized=True)
-        self.val_dataset = ClimateDataset(val_input_norm_dask, val_output_norm_dask, output_is_normalized=True)
-        self.test_dataset = ClimateDataset(test_input_norm_dask, test_output_raw_dask, output_is_normalized=False)
+        T = self.temporal_window 
+        self.train_dataset = ClimateDataset(train_input_norm_dask, train_output_norm_dask, T, output_is_normalized=True)
+        self.val_dataset = ClimateDataset(val_input_norm_dask, val_output_norm_dask, T, output_is_normalized=True)
+        self.test_dataset = ClimateDataset(test_input_norm_dask, test_output_raw_dask, T, output_is_normalized=False)
 
         # Log dataset sizes in a single message
         log.info(
             f"Datasets created. Train: {len(self.train_dataset)}, Val: {len(self.val_dataset)} (last months of {val_ssp}), Test: {len(self.test_dataset)}"
         )
+        print(f"Datasets created. Train: {len(self.train_dataset)}, Val: {len(self.val_dataset)} (last months of {val_ssp}), Test: {len(self.test_dataset)}")
 
     # Common DataLoader configuration
     def _get_dataloader_kwargs(self, is_train=False):
@@ -525,7 +548,12 @@ def main(cfg: DictConfig):
     pl.seed_everything(cfg.seed, workers=True)
 
     # Create data module with parameters from configs
-    datamodule = ClimateEmulationDataModule(seed=cfg.seed, **cfg.data)
+    # datamodule = ClimateEmulationDataModule(seed=cfg.seed, **cfg.data)
+    datamodule = ClimateEmulationDataModule(
+        seed=cfg.seed,
+        temporal_window=cfg.model.temporal_window,
+        **cfg.data
+    )
     model = get_model(cfg)
 
     # Create lightning module

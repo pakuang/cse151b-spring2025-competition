@@ -1,0 +1,4 @@
+type: unet_vit
+base_c: 64
+dropout_rate: 0.2
+temporal_window: 3
