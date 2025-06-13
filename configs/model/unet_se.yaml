@@ -1,6 +1,5 @@
 type: unet_se
 base_c: 64
 dropout_rate: 0.2
-temporal_window: 2
-# n_input_channels: 5  # Will be set dynamically
-# n_output_channels: 2  # Will be set dynamically
+temporal_window: 1
+
