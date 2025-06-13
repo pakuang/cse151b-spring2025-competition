@@ -9,7 +9,6 @@ def get_model(cfg: DictConfig):
     model_kwargs = {k: v for k, v in cfg.model.items() if k != "type"}
     T = cfg.model.temporal_window if "temporal_window" in cfg.model else 1
     model_kwargs["n_input_channels"] = len(cfg.data.input_vars)
-    #len(cfg.data.input_vars)
     model_kwargs["temporal_window"] = T
     model_kwargs["n_output_channels"] = len(cfg.data.output_vars)
     model_kwargs_clean = {k: v for k, v in model_kwargs.items() if k != "temporal_window"}
@@ -74,6 +73,7 @@ class SimpleCNN(nn.Module):
         init_dim=64,
         depth=4,
         dropout_rate=0.2,
+        temporal_window=None
     ):
         super().__init__()
 
@@ -114,7 +114,7 @@ class SimpleCNN(nn.Module):
 
         return x
 
-# ---------------- model 2 ----------------
+# ---------------- model 2 [Unet + SE] ----------------
 
 class SEBlock(nn.Module):
     def __init__(self, channels, reduction=16):
@@ -189,7 +189,7 @@ class UNetWithSEBlock(nn.Module):
         return self.final(d1)
 
 
-## ---------------- model 3 ----------------
+## ---------------- model 3  [Unet + CBAM] ----------------
 class ChannelAttention(nn.Module):
     def __init__(self, in_channels, reduction=16):
         super().__init__()
@@ -233,41 +233,56 @@ class CBAM(nn.Module):
         return out
 
 class UNetWithCBAM(nn.Module):
-    def __init__(self, n_input_channels, n_output_channels, base_c=64, dropout_rate=0.2, temporal_window=3):
+    def __init__(self, n_input_channels, n_output_channels, base_c=64, dropout_rate=0.2, temporal_window=1):
         super().__init__()
         in_channels = n_input_channels * temporal_window
-        self.enc1 = ConvBlock(n_input_channels, base_c)
+
+        # Encoder
+        self.enc1 = ConvBlock(in_channels, base_c)
+        self.cbam1 = CBAM(base_c)
         self.pool1 = nn.MaxPool2d(2)
+
         self.enc2 = ConvBlock(base_c, base_c * 2)
+        self.cbam2 = CBAM(base_c * 2)
         self.pool2 = nn.MaxPool2d(2)
 
+        # Bottleneck
         self.bottleneck = ConvBlock(base_c * 2, base_c * 4)
+        self.cbam_bottleneck = CBAM(base_c * 4)
         self.dropout = nn.Dropout2d(dropout_rate)
 
-        self.up2 = nn.ConvTranspose2d(base_c * 4, base_c * 2, 2, stride=2)
-        self.dec2 = nn.Sequential(
-            ConvBlock(base_c * 4, base_c * 2),
-            nn.Dropout2d(dropout_rate)
-        )
+        # Decoder
+        self.up2 = nn.ConvTranspose2d(base_c * 4, base_c * 2, kernel_size=2, stride=2)
+        self.dec2 = ConvBlock(base_c * 4, base_c * 2)
+        self.cbam_dec2 = CBAM(base_c * 2)
 
-        self.up1 = nn.ConvTranspose2d(base_c * 2, base_c, 2, stride=2)
-        self.dec1 = nn.Sequential(
-            ConvBlock(base_c * 2, base_c),
-            nn.Dropout2d(dropout_rate)
-        )
+        self.up1 = nn.ConvTranspose2d(base_c * 2, base_c, kernel_size=2, stride=2)
+        self.dec1 = ConvBlock(base_c * 2, base_c)
+        self.cbam_dec1 = CBAM(base_c)
 
+        # Final
         self.final = nn.Conv2d(base_c, n_output_channels, kernel_size=1)
 
     def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool1(e1))
-        b = self.bottleneck(self.pool2(e2))
+        # Encoder
+        e1 = self.cbam1(self.enc1(x))                # [B, base_c, H, W]
+        e2 = self.cbam2(self.enc2(self.pool1(e1)))   # [B, base_c*2, H/2, W/2]
+
+        # Bottleneck
+        b = self.cbam_bottleneck(self.bottleneck(self.pool2(e2)))
         b = self.dropout(b)
-        d2 = self.dec2(torch.cat([self.up2(b), e2], dim=1))
-        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+
+        # Decoder
+        up2 = self.up2(b)
+        d2 = self.cbam_dec2(self.dec2(torch.cat([up2, e2], dim=1)))
+
+        up1 = self.up1(d2)
+        d1 = self.cbam_dec1(self.dec1(torch.cat([up1, e1], dim=1)))
+
         return self.final(d1)
 
-## ---------------- model 4 ----------------
+
+## ---------------- model 4  [Unet + VIT] ----------------
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
 
@@ -344,8 +359,24 @@ class UNetWithViTBottleneck(nn.Module):
         out_pr  = self.final_pr(d1)               # use d1, not x
         return torch.cat([out_tas, out_pr], dim=1)  # (B, 2, 48, 72)
 
-## ---------------- model 5 ----------------
-#unet and convlstm hybrid
+## ---------------- model 5  [Unet + ConvLSTM] ----------------
+class Temporal3DEncoder(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv3d = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, kernel_size=(3,3,3), padding=(1,1,1)),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(out_ch, out_ch, kernel_size=(1,3,3), padding=(0,1,1)),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x3d):  # [B, T, C, H, W]
+        x3d = x3d.permute(0, 2, 1, 3, 4)  # → [B, C, T, H, W]
+        out = self.conv3d(x3d)           # → [B, out_ch, T, H, W]
+        out_last = out[:, :, -1, :, :]   # Collapse T: pick last frame
+        return out_last                  # → [B, out_ch, H, W]
 
 class ConvLSTMCell(nn.Module):
     def __init__(self, input_dim, hidden_dim, kernel_size=3):
@@ -397,7 +428,8 @@ class DecoderBlock(nn.Module):
 class ConvLSTMUNet(nn.Module):
     def __init__(self, n_input_channels, n_output_channels, base_c=64, temporal_window=None):
         super().__init__()
-
+        
+        self.base_c = base_c 
         self.encoder1 = DecoderBlock(n_input_channels, base_c)
         self.pool1 = nn.MaxPool2d(2)
 
@@ -405,318 +437,188 @@ class ConvLSTMUNet(nn.Module):
         self.pool2 = nn.MaxPool2d(2)
 
         self.convlstm = ConvLSTM(base_c * 2, base_c * 4)
+        self.temporal3d = Temporal3DEncoder(in_ch=n_input_channels, out_ch=base_c)
 
-        self.up2 = nn.ConvTranspose2d(base_c * 4, base_c * 2, kernel_size=2, stride=2)
-        self.decoder2 = DecoderBlock(base_c * 4, base_c * 2)
+        
+        # ==== TAS decoder branch ====
+        self.up2_tas  = nn.ConvTranspose2d(base_c * 4, base_c * 2, kernel_size=2, stride=2)
+        self.dec2_tas = DecoderBlock(base_c * 4, base_c * 2)
+        self.up1_tas  = nn.ConvTranspose2d(base_c * 2, base_c,     kernel_size=2, stride=2)
+        self.dec1_tas = DecoderBlock(base_c * 2, base_c)
+        self.final_tas = nn.Conv2d(base_c, 1, kernel_size=1)  # produces 1 channel (tas)
 
-        self.up1 = nn.ConvTranspose2d(base_c * 2, base_c, kernel_size=2, stride=2)
-        self.decoder1 = DecoderBlock(base_c * 2, base_c)
-
-        self.final_tas = nn.Conv2d(base_c, 1, kernel_size=1)
-        self.final_pr = nn.Conv2d(base_c, 1, kernel_size=1)
+        # ==== PR decoder branch ====
+        self.up2_pr   = nn.ConvTranspose2d(base_c * 4, base_c * 2, kernel_size=2, stride=2)
+        self.dec2_pr  = DecoderBlock(base_c * 4, base_c * 2)
+        self.up1_pr   = nn.ConvTranspose2d(base_c * 2, base_c,     kernel_size=2, stride=2)
+        self.dec1_pr  = DecoderBlock(base_c * 2, base_c)
+        self.final_pr = nn.Conv2d(base_c, 1, kernel_size=1)  # produces 1 channel (pr)
 
     def forward(self, x):  # x: (B, T, C, H, W)
         B, T, C, H, W = x.shape
-        x_seq = x.reshape(B * T, C, H, W)
+        bc = self.base_c  # alias for convenience
 
-        e1 = self.encoder1(x_seq)
-        e1 = e1.view(B, T, -1, H, W)
-        e1_t = e1[:, -1]  # save final e1 for skip connection
+        # --- TEMPORAL 3D ENCODER ---
+        t3d_out = self.temporal3d(x)  # [B, bc, H, W]
+        
+        # --- 1) Encoder 1 over time frames ---
+        x_seq = x.view(B * T, C, H, W)
+        e1    = self.encoder1(x_seq).view(B, T, bc, H, W)
+        e1_t  = e1[:, -1, :, :, :] + t3d_out  # fused features
 
-        p1 = self.pool1(e1.reshape(B * T, -1, H, W))
-        e2 = self.encoder2(p1)
-        e2 = e2.view(B, T, -1, H // 2, W // 2)
+        # # --- 1) Encoder 1 over time frames ---
+        # x_seq = x.view(B * T, C, H, W)          # [B*T, C,  H,   W]
+        # e1    = self.encoder1(x_seq)            # [B*T, bc, H,   W]
+        # e1    = e1.view(B, T, bc, H, W)         # [B, T, bc, H, W]
+        # e1_t  = e1[:, -1, :, :, :]              # [B, bc, H, W]
+    
+        # --- 2) Encoder 2 over pooled features ---
+        p1    = e1.reshape(B * T, bc, H, W)     # [B*T, bc, H,   W]
+        p1    = self.pool1(p1)                  # [B*T, bc, H/2, W/2]
+        e2    = self.encoder2(p1)               # [B*T, bc*2, H/2, W/2]
+        e2    = e2.view(B, T, bc * 2, H // 2, W // 2)  # [B, T, 2·bc, H/2, W/2]
+        e2_t  = e2[:, -1, :, :, :]              # [B, 2·bc, H/2, W/2]
+    
+        # --- 3) ConvLSTM bottleneck ---
+        p2    = e2.reshape(B * T, bc * 2, H // 2, W // 2)  # [B*T, 2·bc, H/2, W/2]
+        p2    = self.pool2(p2)                             # [B*T, 2·bc, H/4, W/4]
+        x_seq_lstm = p2.view(B, T, bc * 2, H // 4, W // 4)  # [B, T, 2·bc, H/4, W/4]
+        b = self.convlstm(x_seq_lstm)                       # [B, 4·bc, H/4, W/4]
 
-        p2 = self.pool2(e2.reshape(B * T, -1, H // 2, W // 2))
-        x_seq_lstm = p2.view(B, T, -1, H // 4, W // 4)
+        
+        # --- 4) Tas decoder branch ---
+        up2_tas_out = self.up2_tas(b)                        # [B, 2·bc, H/2, W/2]
+        d2_tas       = self.dec2_tas(torch.cat([up2_tas_out, e2_t], dim=1))  # [B, 2·bc, H/2, W/2]
+        up1_tas_out  = self.up1_tas(d2_tas)                   # [B, bc, H, W]
+        d1_tas       = self.dec1_tas(torch.cat([up1_tas_out, e1_t], dim=1))   # [B, bc, H, W]
+        out_tas      = self.final_tas(d1_tas)                 # [B, 1, H, W]
+    
+        # --- 5) Pr decoder branch ---
+        up2_pr_out = self.up2_pr(b)                           # [B, 2·bc, H/2, W/2]
+        d2_pr       = self.dec2_pr(torch.cat([up2_pr_out, e2_t], dim=1))       # [B, 2·bc, H/2, W/2]
+        up1_pr_out  = self.up1_pr(d2_pr)                      # [B, bc, H, W]
+        d1_pr       = self.dec1_pr(torch.cat([up1_pr_out, e1_t], dim=1))       # [B, bc, H, W]
+        out_pr      = self.final_pr(d1_pr)                    # [B, 1, H, W]
+    
+        return torch.cat([out_tas, out_pr], dim=1)             # [B, 2, H, W]
 
-        b = self.convlstm(x_seq_lstm)  # (B, 4C, H/4, W/4)
+########################## ablation studies ##########################
 
-        d2 = self.decoder2(torch.cat([self.up2(b), e2[:, -1]], dim=1))
-        d1 = self.decoder1(torch.cat([self.up1(d2), e1_t], dim=1))
-
-        out_tas = self.final_tas(d1)
-        out_pr = self.final_pr(d1)
-        return torch.cat([out_tas, out_pr], dim=1)  # (B, 2, H, W)
-
-
-
-
-## ---------------- model 6 ----------------
-# # SEBlock
-# class SEBlock(nn.Module):
-#     def __init__(self, channels, reduction=16):
-#         super().__init__()
-#         self.pool = nn.AdaptiveAvgPool2d(1)
-#         self.fc = nn.Sequential(
-#             nn.Linear(channels, channels // reduction, bias=False),
-#             nn.ReLU(inplace=True),
-#             nn.Linear(channels // reduction, channels, bias=False),
-#             nn.Sigmoid()
-#         )
-
-#     def forward(self, x):
-#         b, c, _, _ = x.size()
-#         y = self.pool(x).view(b, c)
-#         y = self.fc(y).view(b, c, 1, 1)
-#         return x * y.expand_as(x)
-
-
-# # ConvLSTM Cell
-# class ConvLSTMCell(nn.Module):
-#     def __init__(self, input_dim, hidden_dim, kernel_size=3):
-#         super().__init__()
-#         padding = kernel_size // 2
-#         self.conv = nn.Conv2d(input_dim + hidden_dim, 4 * hidden_dim, kernel_size, padding=padding)
-
-#     def forward(self, x, h_prev, c_prev):
-#         combined = torch.cat([x, h_prev], dim=1)
-#         gates = self.conv(combined)
-#         i, f, o, g = torch.chunk(gates, 4, dim=1)
-#         i, f, o = torch.sigmoid(i), torch.sigmoid(f), torch.sigmoid(o)
-#         g = torch.tanh(g)
-#         c = f * c_prev + i * g
-#         h = o * torch.tanh(c)
-#         return h, c
-
-
-# # ConvLSTM Stack (2 layers)
-# class ConvLSTM(nn.Module):
-#     def __init__(self, input_dim, hidden_dim, kernel_size=3):
-#         super().__init__()
-#         self.input_dim = input_dim
-#         self.hidden_dim = hidden_dim
-
-#         self.cell1 = ConvLSTMCell(input_dim, hidden_dim, kernel_size)
-#         self.cell2 = ConvLSTMCell(hidden_dim, hidden_dim, kernel_size)
-
-#     def forward(self, x_seq):  # x_seq: (B, T, C, H, W)
-#         B, T, C, H, W = x_seq.size()
-
-#         # hidden states must have hidden_dim channels, not C
-#         h1 = torch.zeros(B, self.hidden_dim, H, W, device=x_seq.device)
-#         c1 = torch.zeros(B, self.hidden_dim, H, W, device=x_seq.device)
-#         h2 = torch.zeros(B, self.hidden_dim, H, W, device=x_seq.device)
-#         c2 = torch.zeros(B, self.hidden_dim, H, W, device=x_seq.device)
-
-#         for t in range(T):
-#             h1, c1 = self.cell1(x_seq[:, t], h1, c1)
-#             h2, c2 = self.cell2(h1, h2, c2)
-
-#         return h2
-
-
-
-# # Conv Block
-# class ConvBlock(nn.Module):
-#     def __init__(self, in_c, out_c):
-#         super().__init__()
-#         self.block = nn.Sequential(
-#             nn.Conv2d(in_c, out_c, 3, padding=1),
-#             nn.BatchNorm2d(out_c),
-#             nn.ReLU(inplace=True),
-#             nn.Conv2d(out_c, out_c, 3, padding=1),
-#             nn.BatchNorm2d(out_c),
-#             nn.ReLU(inplace=True)
-#         )
-
-#     def forward(self, x):
-#         return self.block(x)
-
-
-# # Final Model
-# class ConvLSTMUNetSE(nn.Module):
-#     def __init__(self, n_input_channels, n_output_channels, base_c=64, dropout_rate=0.2, temporal_window=None):
+## ---------------- model 6  [Unet + ConvLSTM No temporal encoder] ----------------
+# class ConvLSTMUNet(nn.Module):
+#     def __init__(self, n_input_channels, n_output_channels, base_c=64, temporal_window=None):
 #         super().__init__()
 
-#         self.encoder1 = ConvBlock(n_input_channels, base_c)
+#         self.base_c = base_c
+#         self.encoder1 = DecoderBlock(n_input_channels, base_c)
 #         self.pool1 = nn.MaxPool2d(2)
 
-#         self.encoder2 = ConvBlock(base_c, base_c * 2)
+#         self.encoder2 = DecoderBlock(base_c, base_c * 2)
 #         self.pool2 = nn.MaxPool2d(2)
 
 #         self.convlstm = ConvLSTM(base_c * 2, base_c * 4)
-#         self.se = SEBlock(base_c * 4)
-#         self.dropout = nn.Dropout2d(dropout_rate)
 
+#         # ==== TAS decoder branch ====
+#         self.up2_tas = nn.ConvTranspose2d(base_c * 4, base_c * 2, kernel_size=2, stride=2)
+#         self.dec2_tas = DecoderBlock(base_c * 4, base_c * 2)
+#         self.up1_tas = nn.ConvTranspose2d(base_c * 2, base_c, kernel_size=2, stride=2)
+#         self.dec1_tas = DecoderBlock(base_c * 2, base_c)
+#         self.final_tas = nn.Conv2d(base_c, 1, kernel_size=1)
+
+#         # ==== PR decoder branch ====
+#         self.up2_pr = nn.ConvTranspose2d(base_c * 4, base_c * 2, kernel_size=2, stride=2)
+#         self.dec2_pr = DecoderBlock(base_c * 4, base_c * 2)
+#         self.up1_pr = nn.ConvTranspose2d(base_c * 2, base_c, kernel_size=2, stride=2)
+#         self.dec1_pr = DecoderBlock(base_c * 2, base_c)
+#         self.final_pr = nn.Conv2d(base_c, 1, kernel_size=1)
+
+#     def forward(self, x):  # x: (B, T, C, H, W)
+#         B, T, C, H, W = x.shape
+#         bc = self.base_c
+
+#         # --- Encoder 1 ---
+#         x_seq = x.view(B * T, C, H, W)
+#         e1 = self.encoder1(x_seq).view(B, T, bc, H, W)
+#         e1_t = e1[:, -1, :, :, :]  # Removed t3d_out fusion
+
+#         # --- Encoder 2 ---
+#         p1 = e1.view(B * T, bc, H, W)
+#         p1 = self.pool1(p1)
+#         e2 = self.encoder2(p1).view(B, T, bc * 2, H // 2, W // 2)
+#         e2_t = e2[:, -1, :, :, :]
+
+#         # --- ConvLSTM bottleneck ---
+#         p2 = e2.view(B * T, bc * 2, H // 2, W // 2)
+#         p2 = self.pool2(p2)
+#         x_seq_lstm = p2.view(B, T, bc * 2, H // 4, W // 4)
+#         b = self.convlstm(x_seq_lstm)
+
+#         # --- Tas decoder ---
+#         up2_tas_out = self.up2_tas(b)
+#         d2_tas = self.dec2_tas(torch.cat([up2_tas_out, e2_t], dim=1))
+#         up1_tas_out = self.up1_tas(d2_tas)
+#         d1_tas = self.dec1_tas(torch.cat([up1_tas_out, e1_t], dim=1))
+#         out_tas = self.final_tas(d1_tas)
+
+#         # --- Pr decoder ---
+#         up2_pr_out = self.up2_pr(b)
+#         d2_pr = self.dec2_pr(torch.cat([up2_pr_out, e2_t], dim=1))
+#         up1_pr_out = self.up1_pr(d2_pr)
+#         d1_pr = self.dec1_pr(torch.cat([up1_pr_out, e1_t], dim=1))
+#         out_pr = self.final_pr(d1_pr)
+
+#         return torch.cat([out_tas, out_pr], dim=1)
+
+
+## ---------------- model 7  [Unet + ConvLSTM No separate decoder head] -----------
+# class ConvLSTMUNet(nn.Module):
+#     def __init__(self, n_input_channels, n_output_channels=2, base_c=64, temporal_window=None):
+#         super().__init__()
+
+#         self.base_c = base_c 
+#         self.encoder1 = DecoderBlock(n_input_channels, base_c)
+#         self.pool1 = nn.MaxPool2d(2)
+
+#         self.encoder2 = DecoderBlock(base_c, base_c * 2)
+#         self.pool2 = nn.MaxPool2d(2)
+
+#         self.convlstm = ConvLSTM(base_c * 2, base_c * 4)
+#         self.temporal3d = Temporal3DEncoder(in_ch=n_input_channels, out_ch=base_c)
+
+#         # Shared decoder
 #         self.up2 = nn.ConvTranspose2d(base_c * 4, base_c * 2, kernel_size=2, stride=2)
-#         self.decoder2 = ConvBlock(256, 128)
-
+#         self.dec2 = DecoderBlock(base_c * 4, base_c * 2)
 #         self.up1 = nn.ConvTranspose2d(base_c * 2, base_c, kernel_size=2, stride=2)
-#         self.decoder1 = ConvBlock(base_c * 2, base_c)
-
-#         self.tas_head = nn.Sequential(
-#             nn.Conv2d(base_c, base_c // 2, 3, padding=1),
-#             nn.ReLU(inplace=True),
-#             nn.Conv2d(base_c // 2, 1, 1)
-#         )
-
-#         self.pr_head = nn.Sequential(
-#             nn.Conv2d(base_c, base_c // 2, 3, padding=1),
-#             nn.ReLU(inplace=True),
-#             nn.Conv2d(base_c // 2, 1, 1)
-#         )
+#         self.dec1 = DecoderBlock(base_c * 2, base_c)
+#         self.final = nn.Conv2d(base_c, n_output_channels, kernel_size=1)  # shared output
 
 #     def forward(self, x):  # x: (B, T, C, H, W)
 #         B, T, C, H, W = x.shape
-#         x_seq = x.reshape(B * T, C, H, W)
+#         bc = self.base_c
 
-#         e1 = self.encoder1(x_seq)
-#         e1 = e1.view(B, T, -1, H, W)
-#         e1_skip = e1[:, -1]
+#         # Temporal encoding
+#         t3d_out = self.temporal3d(x)
 
-#         p1 = self.pool1(e1.reshape(B * T, -1, H, W))
-#         e2 = self.encoder2(p1)
-#         e2 = e2.view(B, T, -1, H // 2, W // 2)
-#         e2_skip = e2[:, -1]
+#         # Encoder path
+#         x_seq = x.view(B * T, C, H, W)
+#         e1 = self.encoder1(x_seq).view(B, T, bc, H, W)
+#         e1_t = e1[:, -1, :, :, :] + t3d_out
 
-#         p2 = self.pool2(e2.reshape(B * T, -1, H // 2, W // 2))
-#         x_seq_lstm = p2.view(B, T, -1, H // 4, W // 4)
+#         p1 = e1.view(B * T, bc, H, W)
+#         p1 = self.pool1(p1)
+#         e2 = self.encoder2(p1).view(B, T, bc * 2, H // 2, W // 2)
+#         e2_t = e2[:, -1, :, :, :]
 
-#         b = self.convlstm(x_seq_lstm)  # temporal modeling
-#         b = self.se(b)
-#         b = self.dropout(b)
+#         p2 = e2.view(B * T, bc * 2, H // 2, W // 2)
+#         p2 = self.pool2(p2)
+#         x_seq_lstm = p2.view(B, T, bc * 2, H // 4, W // 4)
+#         b = self.convlstm(x_seq_lstm)
 
-#         d2 = self.decoder2(torch.cat([self.up2(b), e2_skip], dim=1))
-#         d1 = self.decoder1(torch.cat([self.up1(d2), e1_skip], dim=1))
+#         # Shared decoder
+#         up2_out = self.up2(b)
+#         d2 = self.dec2(torch.cat([up2_out, e2_t], dim=1))
+#         up1_out = self.up1(d2)
+#         d1 = self.dec1(torch.cat([up1_out, e1_t], dim=1))
+#         out = self.final(d1)  # [B, 2, H, W]
 
-#         out_tas = self.tas_head(d1)
-#         out_pr = self.pr_head(d1)
-
-#         return torch.cat([out_tas, out_pr], dim=1)
-
-
-# class SpatialAttention(nn.Module):
-#     def __init__(self, in_channels):
-#         super().__init__()
-#         self.conv = nn.Conv2d(in_channels, 1, kernel_size=7, padding=3)
-#         self.sigmoid = nn.Sigmoid()
-
-#     def forward(self, x):
-#         return x * self.sigmoid(self.conv(x))
-
-
-# class ConvLSTMCell(nn.Module):
-#     def __init__(self, input_dim, hidden_dim, kernel_size=3):
-#         super().__init__()
-#         padding = kernel_size // 2
-#         self.conv = nn.Conv2d(input_dim + hidden_dim, 4 * hidden_dim, kernel_size, padding=padding)
-#         self.norm = nn.GroupNorm(8, 4 * hidden_dim)  # step 6
-
-#     def forward(self, x, h_prev, c_prev):
-#         combined = torch.cat([x, h_prev], dim=1)
-#         gates = self.norm(self.conv(combined))
-#         i, f, o, g = torch.chunk(gates, 4, dim=1)
-#         i, f, o = torch.sigmoid(i), torch.sigmoid(f), torch.sigmoid(o)
-#         g = torch.tanh(g)
-#         c = f * c_prev + i * g
-#         h = o * torch.tanh(c)
-#         return h, c
-
-
-# class ConvLSTM(nn.Module):
-#     def __init__(self, input_dim, hidden_dim, kernel_size=3):
-#         super().__init__()
-#         self.cell1 = ConvLSTMCell(input_dim, hidden_dim, kernel_size)
-#         self.cell2 = ConvLSTMCell(hidden_dim, hidden_dim, kernel_size)
-
-#     def forward(self, x_seq):  # (B, T, C, H, W)
-#         B, T, C, H, W = x_seq.size()
-#         h1 = torch.zeros(B, self.cell1.conv.out_channels // 4, H, W, device=x_seq.device)
-#         c1 = torch.zeros_like(h1)
-#         h2 = torch.zeros_like(h1)
-#         c2 = torch.zeros_like(h1)
-
-#         for t in range(T):
-#             h1, c1 = self.cell1(x_seq[:, t], h1, c1)
-#             h2, c2 = self.cell2(h1, h2, c2)
-#         return h2
-
-
-# class ConvBlock(nn.Module):
-#     def __init__(self, in_c, out_c):
-#         super().__init__()
-#         self.block = nn.Sequential(
-#             nn.Conv2d(in_c, out_c, 3, padding=1),
-#             nn.BatchNorm2d(out_c),
-#             nn.ReLU(inplace=True),
-#             nn.Conv2d(out_c, out_c, 3, padding=1),
-#             nn.BatchNorm2d(out_c),
-#             nn.ReLU(inplace=True),
-#         )
-
-#     def forward(self, x):
-#         return self.block(x)
-
-
-# class SEBlock(nn.Module):
-#     def __init__(self, channels, reduction=16):
-#         super().__init__()
-#         self.pool = nn.AdaptiveAvgPool2d(1)
-#         self.fc = nn.Sequential(
-#             nn.Linear(channels, channels // reduction, bias=False),
-#             nn.ReLU(inplace=True),
-#             nn.Linear(channels // reduction, channels, bias=False),
-#             nn.Sigmoid(),
-#         )
-
-#     def forward(self, x):
-#         b, c, _, _ = x.size()
-#         y = self.pool(x).view(b, c)
-#         y = self.fc(y).view(b, c, 1, 1)
-#         return x * y.expand_as(x)
-
-
-# class ConvLSTMUNetSE(nn.Module):
-#     def __init__(self, n_input_channels, n_output_channels, base_c=64, dropout_rate=0.2, temporal_window=None):
-#         super().__init__()
-#         # — Encoder Level 1 (H×W → ½H×½W for ConvLSTM)
-#         self.encoder1 = ConvBlock(n_input_channels, base_c)
-#         self.pool1    = nn.MaxPool2d(2)
-
-#         # — ConvLSTM “bottleneck” at ½ resolution
-#         self.convlstm  = ConvLSTM(base_c, base_c * 2)       # step 3
-#         self.att       = SpatialAttention(base_c * 2)       # step 5
-#         self.se        = SEBlock(base_c * 2)                
-#         self.dropout   = nn.Dropout2d(dropout_rate)
-
-#         # — Decoder back to full resolution (UNet-style)
-#         self.up1    = nn.ConvTranspose2d(base_c * 2, base_c, kernel_size=2, stride=2)
-#         self.decoder1 = ConvBlock(base_c * 2, base_c)
-
-#         # — Separate tas/pr heads
-#         self.tas_head = nn.Sequential(
-#             nn.Conv2d(base_c, base_c // 2, 3, padding=1),
-#             nn.ReLU(inplace=True),
-#             nn.Conv2d(base_c // 2, 1, 1),
-#         )
-#         self.pr_head = nn.Sequential(
-#             nn.Conv2d(base_c, base_c // 2, 3, padding=1),
-#             nn.ReLU(inplace=True),
-#             nn.Conv2d(base_c // 2, 1, 1),
-#             nn.Softplus(),  # step 4
-#         )
-
-#     def forward(self, x):  # x: (B, T, C, H, W)
-#         B, T, C, H, W = x.shape
-
-#         # — Encode each timestep, keep the last for the skip:
-#         x_flat = x.view(B * T, C, H, W)
-#         e1      = self.encoder1(x_flat).view(B, T, -1, H, W)
-#         skip1   = e1[:, -1]                                   # (B, base_c, H, W)
-
-#         # — Pool & convlstm:
-#         p1      = self.pool1(e1.reshape(B * T, -1, H, W)).view(B, T, -1, H // 2, W // 2)
-#         b       = self.convlstm(p1)                          # (B, base_c*2, H/2, W/2)
-#         b       = self.att(b)
-#         b       = self.se(b)
-#         b       = self.dropout(b)
-
-#         # — Decode back up:
-#         d1      = self.up1(b)                                # (B, base_c, H, W)
-#         d1      = self.decoder1(torch.cat([d1, skip1], dim=1))  # (B, base_c, H, W)
-
-#         # — Heads:
-#         out_tas = self.tas_head(d1)
-#         out_pr  = self.pr_head(d1)
-#         return torch.cat([out_tas, out_pr], dim=1)
+#         return out
